@@ -1,0 +1,97 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  body {
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  }
+
+  h1, h2, h3, .font-display {
+    font-family: 'Outfit', system-ui, -apple-system, sans-serif;
+  }
+
+  .font-mono, .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+
+  img {
+    -webkit-user-drag: none;
+    user-select: none;
+  }
+}
+
+@keyframes nexus-wave {
+  0%, 100% {
+    transform: scaleY(0.35);
+    opacity: 0.55;
+  }
+  50% {
+    transform: scaleY(1);
+    opacity: 1;
+  }
+}
+
+@keyframes nexus-ring-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes nexus-ring-spin-reverse {
+  from {
+    transform: rotate(360deg);
+  }
+  to {
+    transform: rotate(0deg);
+  }
+}
+
+@keyframes nexus-core-pulse {
+  0%, 100% {
+    transform: scale(0.97);
+    opacity: 0.72;
+  }
+  50% {
+    transform: scale(1.04);
+    opacity: 1;
+  }
+}
+
+.animate-nexus-wave {
+  animation: nexus-wave 1.1s ease-in-out infinite;
+  transform-origin: center;
+}
+
+.animate-nexus-ring-slow {
+  animation: nexus-ring-spin 28s linear infinite;
+}
+
+.animate-nexus-ring-medium {
+  animation: nexus-ring-spin 12s linear infinite;
+}
+
+.animate-nexus-ring-reverse {
+  animation: nexus-ring-spin-reverse 20s linear infinite;
+}
+
+.animate-nexus-ring-fast {
+  animation: nexus-ring-spin 4.5s linear infinite;
+}
+
+.animate-nexus-core-pulse {
+  animation: nexus-core-pulse 2.6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-nexus-wave,
+  .animate-nexus-ring-slow,
+  .animate-nexus-ring-medium,
+  .animate-nexus-ring-reverse,
+  .animate-nexus-ring-fast,
+  .animate-nexus-core-pulse {
+    animation: none;
+  }
+}

@@ -1,0 +1,839 @@
+import 'dotenv/config';
+import express from 'express';
+import http from 'node:http';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { WebSocketServer, WebSocket } from 'ws';
+import {
+  GoogleGenAI,
+  LiveServerMessage,
+  Modality,
+  ThinkingLevel,
+  Type,
+} from '@google/genai';
+import { createServer as createViteServer } from 'vite';
+import { AuthRequest, requireAuth } from './src/middleware/auth.ts';
+import {
+  clearConversationHistory,
+  createAutomationRecord,
+  createPlaylistRecord,
+  deleteCustomVoiceProfileRecord,
+  deleteTrackRecord,
+  getOrCreateUser,
+  getUserWorkspace,
+  markAutomationExecuted,
+  recordTrackPlay,
+  saveConversationMessage,
+  saveDeviceFileRecord,
+  updateFilePageProgress,
+  updateUserSettings,
+  upsertAppPermissionRecord,
+  upsertCustomVoiceProfileRecord,
+} from './src/db/repository.ts';
+import {
+  buildGeminiTtsStylePrompt,
+  formatVoiceProfileId,
+  sanitizeGeminiVoiceName,
+} from './src/modules/customVoiceLogic.ts';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PORT = 3000;
+
+function createGenAIClient(): GoogleGenAI | null {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return null;
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
+}
+
+async function startServer() {
+  const app = express();
+  app.use(express.json({ limit: '5mb' }));
+
+  const server = http.createServer(app);
+
+  // Health check
+  app.get('/api/health', (_req, res) => {
+    res.json({ ok: true, service: 'nexus-ai' });
+  });
+
+  // --- Authenticated Cloud SQL Workspace APIs ---
+  app.get('/api/db/workspace', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const email = req.user!.email ?? 'utilizador@nexus.ai';
+      const user = await getOrCreateUser(uid, email, req.user!.name);
+      const workspace = await getUserWorkspace(user.id);
+      res.json({ user: { id: user.id, uid: user.uid, email: user.email }, ...workspace });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Erro ao carregar workspace.';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.put('/api/db/settings', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const user = await getOrCreateUser(req.user!.uid, req.user!.email ?? '', req.user!.name);
+      const updated = await updateUserSettings(user.id, req.body ?? {});
+      res.json({ settings: updated });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Erro ao atualizar definições.';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.post('/api/db/messages', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const user = await getOrCreateUser(req.user!.uid, req.user!.email ?? '', req.user!.name);
+      const saved = await saveConversationMessage(user.id, req.body);
+      res.json({ message: saved });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Erro ao guardar mensagem.';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.delete('/api/db/messages', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const user = await getOrCreateUser(req.user!.uid, req.user!.email ?? '', req.user!.name);
+      await clearConversationHistory(user.id);
+      res.json({ ok: true });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Erro ao limpar histórico.';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.post('/api/db/playlists', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const user = await getOrCreateUser(req.user!.uid, req.user!.email ?? '', req.user!.name);
+      const { name, category, trackIds } = req.body;
+      const created = await createPlaylistRecord(
+        user.id,
+        String(name || 'Nova Lista'),
+        String(category || 'Personalizada'),
+        Array.isArray(trackIds) ? trackIds.map(String) : []
+      );
+      res.json({ playlist: created });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Erro ao criar lista.';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.post('/api/db/tracks/:id/play', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const user = await getOrCreateUser(req.user!.uid, req.user!.email ?? '', req.user!.name);
+      const trackId = Number(req.params.id);
+      const currentCount = Number(req.body?.playCount ?? 0);
+      if (Number.isFinite(trackId)) {
+        await recordTrackPlay(user.id, trackId, currentCount);
+      }
+      res.json({ ok: true });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Erro ao registar reprodução.';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.delete('/api/db/tracks/:id', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const user = await getOrCreateUser(req.user!.uid, req.user!.email ?? '', req.user!.name);
+      const trackId = Number(req.params.id);
+      if (Number.isFinite(trackId)) {
+        await deleteTrackRecord(user.id, trackId);
+      }
+      res.json({ ok: true });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Erro ao apagar música.';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.post('/api/db/files', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const user = await getOrCreateUser(req.user!.uid, req.user!.email ?? '', req.user!.name);
+      const saved = await saveDeviceFileRecord(user.id, req.body);
+      res.json({ file: saved });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Erro ao guardar ficheiro.';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.patch('/api/db/files/:id/progress', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const user = await getOrCreateUser(req.user!.uid, req.user!.email ?? '', req.user!.name);
+      const fileId = Number(req.params.id);
+      const lastPage = Number(req.body?.lastPage ?? 1);
+      if (Number.isFinite(fileId)) {
+        await updateFilePageProgress(user.id, fileId, lastPage);
+      }
+      res.json({ ok: true });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Erro ao atualizar página.';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.post('/api/db/automations', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const user = await getOrCreateUser(req.user!.uid, req.user!.email ?? '', req.user!.name);
+      const created = await createAutomationRecord(user.id, req.body);
+      res.json({ automation: created });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Erro ao criar automação.';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.post('/api/db/automations/:id/run', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const user = await getOrCreateUser(req.user!.uid, req.user!.email ?? '', req.user!.name);
+      const automationId = Number(req.params.id);
+      if (Number.isFinite(automationId)) {
+        await markAutomationExecuted(user.id, automationId);
+      }
+      res.json({ ok: true });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Erro ao registar automação.';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.put('/api/db/app-permissions/:appId', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const user = await getOrCreateUser(req.user!.uid, req.user!.email ?? '', req.user!.name);
+      const payload = req.body;
+      if (!payload || !payload.id) {
+        return res.status(400).json({ error: 'Dados de permissão inválidos.' });
+      }
+      await upsertAppPermissionRecord(user.id, payload);
+      res.json({ ok: true });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Erro ao atualizar permissão.';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.post('/api/db/app-permissions/bulk', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const user = await getOrCreateUser(req.user!.uid, req.user!.email ?? '', req.user!.name);
+      const items = Array.isArray(req.body?.items) ? req.body.items : [];
+      for (const item of items) {
+        if (item?.id) {
+          await upsertAppPermissionRecord(user.id, item);
+        }
+      }
+      res.json({ ok: true });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Erro ao atualizar permissões.';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.put('/api/db/voice-profile', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const user = await getOrCreateUser(req.user!.uid, req.user!.email ?? '', req.user!.name);
+      const saved = await upsertCustomVoiceProfileRecord(user.id, req.body);
+      res.json({ voiceProfile: saved });
+    } catch (error: unknown) {
+      const message =
+        error instanceof Error ? error.message : 'Erro ao guardar perfil de voz personalizada.';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.delete('/api/db/voice-profile', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const user = await getOrCreateUser(req.user!.uid, req.user!.email ?? '', req.user!.name);
+      await deleteCustomVoiceProfileRecord(user.id);
+      res.json({ ok: true });
+    } catch (error: unknown) {
+      const message =
+        error instanceof Error ? error.message : 'Erro ao eliminar perfil de voz personalizada.';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  // --- Gemini AI Natural Language Command & Chat Endpoint ---
+  app.post('/api/ai/interpret', async (req, res) => {
+    try {
+      const ai = createGenAIClient();
+      if (!ai) {
+        return res.status(503).json({
+          error: 'GEMINI_API_KEY não configurada no servidor.',
+        });
+      }
+
+      const {
+        command,
+        history = [],
+        userName = 'Utilizador',
+        language = 'pt-AO',
+        highThinking = false,
+        availableTracks = [],
+        availableFiles = [],
+        availableAutomations = [],
+        currentTrackTitle = null,
+        currentDocumentTitle = null,
+      } = req.body ?? {};
+
+      if (!command || typeof command !== 'string') {
+        return res.status(400).json({ error: 'Comando inválido.' });
+      }
+
+      const systemInstruction = [
+        `És o NEXUS AI, um assistente pessoal inteligente de alta precisão que compreende português natural, incluindo português de Angola (${language}).`,
+        `Chama o utilizador por "${userName}" quando apropriado, de forma humana, natural e concisa.`,
+        `REGRAS CRÍTICAS DE VERACIDADE:`,
+        `1. NUNCA inventes ou afirmes que uma ação no dispositivo já foi executada se depender do sistema local. Indica a intenção estruturada para que o módulo local execute e confirme realmente.`,
+        `2. Se um pedido for ambíguo (ex.: "Quero ouvir música" sem estilo), faz uma pergunta curta e direta para esclarecer.`,
+        `3. Se o pedido for uma pergunta geral, explicação, estudo ou conversa, responde diretamente de forma clara e útil em português.`,
+        `4. Módulos e ações válidas:`,
+        `   - music: play_track_number (trackNumber), play_category (category, query), play_all, play_recent, pause, resume, stop, next, previous, repeat_current, ask_genre`,
+        `   - files: open_file (paramQuery), open_and_read_file (paramQuery), open_folder (paramQuery), search_files (paramQuery), search_category (paramCategory, paramQuery), open_latest_pdf`,
+        `   - document_reader: read_current, next_page, prev_page, go_to_page (paramTrackNumber como número da página), reread_page, stop_reading, summarize, explain`,
+        `   - automation: run_automation (paramTrigger)`,
+        `   - app_control: open_installed_app (paramApp: nome do aplicativo instalado como WhatsApp, UNITEL Money, PayPay AO, Hinário Umbundu, Gmail, YouTube, etc.), navigate_section (paramCategory: musica|ficheiros|automacoes|definicoes|permissoes), open_app (paramApp: Definições|Galeria|Câmara), go_home, volume_up, volume_down, bluetooth_on, bluetooth_off`,
+        `   - conversation: chat, clarify`,
+        `Contexto atual do dispositivo:`,
+        `- Música em reprodução: ${currentTrackTitle ?? 'Nenhuma'}`,
+        `- Documento aberto: ${currentDocumentTitle ?? 'Nenhum'}`,
+        `- Categorias de música: Música Cristã, Semba & Kizomba, Instrumental, Estudo`,
+        `- Músicas disponíveis (amostra): ${JSON.stringify(availableTracks.slice(0, 12))}`,
+        `- Ficheiros disponíveis (amostra): ${JSON.stringify(availableFiles.slice(0, 10))}`,
+        `- Automações disponíveis: ${JSON.stringify(availableAutomations)}`,
+      ].join('\n');
+
+      const recentHistory = Array.isArray(history)
+        ? history.slice(-8).map((h: { role: string; content: string }) => ({
+            role: h.role === 'assistant' ? 'model' : 'user',
+            parts: [{ text: String(h.content) }],
+          }))
+        : [];
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: [
+          ...recentHistory,
+          { role: 'user', parts: [{ text: command }] },
+        ],
+        config: {
+          systemInstruction,
+          thinkingConfig: {
+            thinkingLevel: highThinking ? ThinkingLevel.HIGH : ThinkingLevel.LOW,
+          },
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              assistantReply: {
+                type: Type.STRING,
+                description: 'Resposta natural em português para o utilizador (breve quando for um comando, detalhada quando for explicação/conversa).',
+              },
+              needsClarification: {
+                type: Type.BOOLEAN,
+              },
+              thinkingSummary: {
+                type: Type.STRING,
+                description: 'Breve resumo de raciocínio em português (1 frase) quando aplicável.',
+              },
+              module: {
+                type: Type.STRING,
+                description: 'music | files | document_reader | app_control | automation | settings | conversation',
+              },
+              action: {
+                type: Type.STRING,
+                description: 'Ação específica do módulo.',
+              },
+              paramQuery: { type: Type.STRING },
+              paramCategory: { type: Type.STRING },
+              paramApp: { type: Type.STRING },
+              paramTrigger: { type: Type.STRING },
+              paramTrackNumber: { type: Type.INTEGER },
+            },
+            required: ['assistantReply', 'needsClarification', 'module', 'action'],
+          },
+        },
+      });
+
+      const raw = (response.text ?? '{}').trim();
+      const parsed = JSON.parse(raw);
+
+      res.json({
+        assistantReply: parsed.assistantReply || 'Compreendido.',
+        needsClarification: Boolean(parsed.needsClarification),
+        thinkingSummary: parsed.thinkingSummary || null,
+        intent: {
+          module: parsed.module || 'conversation',
+          action: parsed.action || 'chat',
+          params: {
+            query: parsed.paramQuery ?? null,
+            category: parsed.paramCategory ?? null,
+            app: parsed.paramApp ?? null,
+            trigger: parsed.paramTrigger ?? null,
+            trackNumber: parsed.paramTrackNumber ?? null,
+          },
+          confidence: 0.94,
+        },
+      });
+    } catch (error: unknown) {
+      console.error('Gemini interpret error:', error);
+      const msg = error instanceof Error ? error.message : 'Erro ao interpretar comando com Gemini.';
+      res.status(500).json({ error: msg });
+    }
+  });
+
+  // --- Gemini Document Analysis (Summarize / Explain with High Thinking) ---
+  app.post('/api/ai/document', async (req, res) => {
+    try {
+      const ai = createGenAIClient();
+      if (!ai) {
+        return res.status(503).json({
+          error: 'GEMINI_API_KEY não configurada no servidor.',
+        });
+      }
+
+      const {
+        title = 'Documento',
+        pageNumber = 1,
+        content = '',
+        task = 'summarize',
+        language = 'pt-AO',
+      } = req.body ?? {};
+
+      const prompt =
+        task === 'explain'
+          ? `Explica de forma clara, didática e em português (${language}) o seguinte conteúdo do documento "${title}" (Página ${pageNumber}). Usa exemplos simples se ajudar a compreender:\n\n${content}`
+          : `Faz um resumo estruturado e conciso em português (${language}) dos pontos-chave do seguinte trecho do documento "${title}" (Página ${pageNumber}):\n\n${content}`;
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: prompt,
+        config: {
+          systemInstruction:
+            'És o módulo de leitura inteligente do NEXUS AI. Responde em português claro e natural, sem marcadores artificiais.',
+          thinkingConfig: {
+            thinkingLevel: ThinkingLevel.HIGH,
+          },
+        },
+      });
+
+      res.json({
+        result: response.text ?? 'Não foi possível gerar a análise do documento.',
+      });
+    } catch (error: unknown) {
+      console.error('Gemini document error:', error);
+      const msg = error instanceof Error ? error.message : 'Erro ao analisar documento.';
+      res.status(500).json({ error: msg });
+    }
+  });
+
+  // --- Custom Voice Calibration & Acoustic Profile Analysis (Gemini 4 Hydrogen) ---
+  app.post('/api/ai/voice-profile/analyze', async (req, res) => {
+    try {
+      const {
+        ownerDisplayName = 'Utilizador',
+        language = 'pt-AO',
+        consentGranted = false,
+        audioBase64 = '',
+        mimeType = 'audio/webm',
+        preferredVoiceName = 'Kore',
+        sampleCount = 1,
+      } = req.body ?? {};
+
+      if (!consentGranted) {
+        return res.status(400).json({
+          error:
+            'Consentimento explícito do proprietário obrigatório antes de criar e guardar o perfil de voz.',
+        });
+      }
+
+      const safePreferred = sanitizeGeminiVoiceName(preferredVoiceName);
+      const voiceId = formatVoiceProfileId(
+        String(ownerDisplayName),
+        `${sampleCount}-${Date.now()}`
+      );
+      const ai = createGenAIClient();
+
+      if (!ai || !audioBase64 || typeof audioBase64 !== 'string') {
+        return res.json({
+          voiceId,
+          geminiVoiceName: safePreferred,
+          acousticStylePrompt: `Voz personalizada de ${ownerDisplayName} em ${language}, timbre natural, entoação humana clara e ritmo equilibrado.`,
+          analysisSummary:
+            'Perfil calibrado localmente com assinatura acústica de estilo. Para análise espectral com Gemini, garante ligação online e amostra de áudio ativa.',
+          cloningNote:
+            'Quando a replicação direta de timbre não está disponível na região/conta, o Gemini TTS aplica o perfil acústico selecionado mantendo ritmo, expressividade e pronúncia portuguesa.',
+        });
+      }
+
+      const cleanBase64 = audioBase64.includes(',')
+        ? audioBase64.split(',')[1]
+        : audioBase64;
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: {
+          parts: [
+            {
+              inlineData: {
+                mimeType: String(mimeType || 'audio/webm'),
+                data: cleanBase64,
+              },
+            },
+            {
+              text: [
+                `Analisa esta amostra de voz do utilizador "${ownerDisplayName}" em português (${language}).`,
+                'Descreve de forma objetiva o timbre (grave/médio/agudo), ritmo de fala, entoação, pausas naturais e traços de pronúncia angolana/portuguesa.',
+                'Escolhe a voz base Gemini mais próxima entre: Kore, Zephyr, Puck, Charon, Fenrir.',
+                'Devolve JSON estrito com geminiVoiceName, acousticStylePrompt (instrução curta de estilo para TTS) e analysisSummary (1-2 frases em português).',
+              ].join(' '),
+            },
+          ],
+        },
+        config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              geminiVoiceName: { type: Type.STRING },
+              acousticStylePrompt: { type: Type.STRING },
+              analysisSummary: { type: Type.STRING },
+            },
+            required: ['geminiVoiceName', 'acousticStylePrompt', 'analysisSummary'],
+          },
+        },
+      });
+
+      const parsed = JSON.parse((response.text ?? '{}').trim());
+      const geminiVoiceName = sanitizeGeminiVoiceName(parsed.geminiVoiceName || safePreferred);
+
+      res.json({
+        voiceId,
+        geminiVoiceName,
+        acousticStylePrompt:
+          parsed.acousticStylePrompt ||
+          `Timbre natural de ${ownerDisplayName} em português (${language}), com dicção nítida e entoação humana.`,
+        analysisSummary:
+          parsed.analysisSummary ||
+          'Amostra vocal analisada com sucesso pelo Gemini e associada ao teu identificador personalizado.',
+        cloningNote:
+          'Calibração concluída com Gemini. Se a clonagem direta de pesos vocais estiver indisponível para a região/conta, o NEXUS AI usa Voice Design (gemini-3.8-flash-tts) com o teu estilo calibrado.',
+      });
+    } catch (error: unknown) {
+      console.error('Voice profile analyze error:', error);
+      const fallbackId = formatVoiceProfileId(
+        String(req.body?.ownerDisplayName ?? 'Utilizador'),
+        String(Date.now())
+      );
+      res.status(200).json({
+        voiceId: fallbackId,
+        geminiVoiceName: sanitizeGeminiVoiceName(req.body?.preferredVoiceName),
+        acousticStylePrompt: `Voz personalizada em português (${req.body?.language ?? 'pt-AO'}), dicção clara e ritmo natural.`,
+        analysisSummary:
+          'Perfil guardado com parâmetros locais (análise acústica remota indisponível neste momento).',
+        cloningNote:
+          'O motor alternará automaticamente entre Gemini TTS online e a voz local do dispositivo quando offline.',
+      });
+    }
+  });
+
+  // --- Gemini Custom Voice TTS Endpoint (gemini-3.8-flash-tts + fallback lite) ---
+  app.post('/api/ai/tts', async (req, res) => {
+    try {
+      const { text, customVoiceProfile, settings } = req.body ?? {};
+      if (!text || typeof text !== 'string') {
+        return res.status(400).json({ error: 'Texto obrigatório para síntese de voz.' });
+      }
+
+      if (!customVoiceProfile?.consentGranted) {
+        return res.status(403).json({
+          error: 'Consentimento do proprietário obrigatório para sintetizar com voz personalizada.',
+        });
+      }
+
+      const ai = createGenAIClient();
+      if (!ai) {
+        return res.json({
+          audioBase64: null,
+          fallbackRecommended: true,
+          reason:
+            'Serviço Gemini TTS indisponível neste ambiente — a utilizar a voz alternativa local configurada.',
+        });
+      }
+
+      const voiceName = sanitizeGeminiVoiceName(customVoiceProfile?.geminiVoiceName);
+      const stylePrompt = buildGeminiTtsStylePrompt(customVoiceProfile, {
+        language: settings?.language || 'pt-AO',
+        assistantUserName: settings?.assistantUserName || 'Utilizador',
+      });
+
+      const trimmedText = text.slice(0, 1800);
+      let modelUsed = 'gemini-3.8-flash-tts';
+      let base64Audio: string | undefined;
+
+      try {
+        const response = await ai.models.generateContent({
+          model: modelUsed,
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                {
+                  text: trimmedText,
+                  speechMetadata: {
+                    style: stylePrompt,
+                  },
+                },
+              ],
+            },
+          ],
+          config: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName },
+              },
+            },
+          },
+        });
+        base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      } catch (primaryErr) {
+        console.warn('gemini-3.8-flash-tts unavailable, trying gemini-3.8-flash-lite-tts:', primaryErr);
+        modelUsed = 'gemini-3.8-flash-lite-tts';
+        try {
+          const fallbackResp = await ai.models.generateContent({
+            model: modelUsed,
+            contents: [
+              {
+                role: 'user',
+                parts: [
+                  {
+                    text: trimmedText,
+                    speechMetadata: {
+                      style: stylePrompt,
+                    },
+                  },
+                ],
+              },
+            ],
+            config: {
+              responseModalities: ['AUDIO'],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName },
+                },
+              },
+            },
+          });
+          base64Audio = fallbackResp.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        } catch (liteErr) {
+          console.warn('gemini-3.8-flash-lite-tts unavailable:', liteErr);
+          return res.json({
+            audioBase64: null,
+            fallbackRecommended: true,
+            reason:
+              'Gemini TTS indisponível para esta conta ou região neste momento — alternado para a voz alternativa local.',
+          });
+        }
+      }
+
+      if (!base64Audio) {
+        return res.json({
+          audioBase64: null,
+          fallbackRecommended: true,
+          reason:
+            'O modelo Gemini TTS não devolveu áudio para esta resposta — alternado para a voz alternativa local.',
+        });
+      }
+
+      res.json({
+        audioBase64: base64Audio,
+        mimeType: 'audio/wav',
+        modelUsed,
+        voiceName,
+        fallbackRecommended: false,
+        aiDisclosure: customVoiceProfile.aiDisclosureEnabled
+          ? 'Áudio sintetizado por IA (Gemini TTS) com perfil de voz autorizado.'
+          : null,
+      });
+    } catch (error: unknown) {
+      console.error('Gemini TTS error:', error);
+      return res.json({
+        audioBase64: null,
+        fallbackRecommended: true,
+        reason:
+          'Não foi possível sintetizar via Gemini TTS neste momento — a utilizar a voz alternativa local.',
+      });
+    }
+  });
+
+  // --- Gemini Live API WebSocket Bridge (gemini-3.8-live) ---
+  const wss = new WebSocketServer({ noServer: true });
+
+  server.on('upgrade', (request, socket, head) => {
+    const reqUrl = request.url ?? '';
+    if (reqUrl.startsWith('/ws/live')) {
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit('connection', ws, request);
+      });
+    }
+  });
+
+  wss.on('connection', async (clientWs: WebSocket, req) => {
+    const ai = createGenAIClient();
+    if (!ai) {
+      clientWs.send(
+        JSON.stringify({
+          error: 'GEMINI_API_KEY não configurada para voz em tempo real.',
+        })
+      );
+      clientWs.close();
+      return;
+    }
+
+    const urlObj = new URL(req.url ?? '/ws/live', `http://${req.headers.host}`);
+    const voiceGender = urlObj.searchParams.get('voice') === 'masculina' ? 'Fenrir' : 'Zephyr';
+    const userName = urlObj.searchParams.get('userName') || 'Utilizador';
+
+    let session: Awaited<ReturnType<typeof ai.live.connect>> | null = null;
+
+    try {
+      session = await ai.live.connect({
+        model: 'gemini-3.8-live',
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: voiceGender },
+            },
+          },
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
+          systemInstruction: `És o NEXUS AI, assistente pessoal inteligente por voz em português (incluindo português de Angola). O utilizador chama-se ${userName}. Responde de forma natural, clara, calorosa e objetiva.`,
+        },
+        callbacks: {
+          onopen: () => {
+            if (clientWs.readyState === WebSocket.OPEN) {
+              clientWs.send(JSON.stringify({ status: 'connected' }));
+            }
+          },
+          onmessage: (message: LiveServerMessage) => {
+            if (clientWs.readyState !== WebSocket.OPEN) return;
+            const sc = message.serverContent;
+            if (sc?.inputTranscription?.text) {
+              clientWs.send(
+                JSON.stringify({ inputTranscript: sc.inputTranscription.text })
+              );
+            }
+            if (sc?.outputTranscription?.text) {
+              clientWs.send(
+                JSON.stringify({ outputTranscript: sc.outputTranscription.text })
+              );
+            }
+            for (const part of sc?.modelTurn?.parts ?? []) {
+              if (part.inlineData?.data) {
+                clientWs.send(JSON.stringify({ audio: part.inlineData.data }));
+              }
+            }
+            if (sc?.interrupted) {
+              clientWs.send(JSON.stringify({ interrupted: true }));
+            }
+            if (sc?.turnComplete) {
+              clientWs.send(JSON.stringify({ turnComplete: true }));
+            }
+          },
+          onerror: (err) => {
+            console.error('Gemini Live error:', err);
+            if (clientWs.readyState === WebSocket.OPEN) {
+              clientWs.send(
+                JSON.stringify({
+                  error: 'Erro na sessão de voz em tempo real.',
+                })
+              );
+            }
+          },
+          onclose: () => {
+            if (clientWs.readyState === WebSocket.OPEN) {
+              clientWs.send(JSON.stringify({ status: 'closed' }));
+            }
+          },
+        },
+      });
+    } catch (error) {
+      console.error('Failed to connect to Gemini Live:', error);
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(
+          JSON.stringify({
+            error: 'Não foi possível ligar ao Gemini Live API.',
+          })
+        );
+        clientWs.close();
+      }
+      return;
+    }
+
+    clientWs.on('message', (raw) => {
+      if (!session) return;
+      try {
+        const msg = JSON.parse(raw.toString());
+        if (msg.audio) {
+          session.sendRealtimeInput({
+            audio: {
+              data: msg.audio,
+              mimeType: 'audio/pcm;rate=16000',
+            },
+          });
+        } else if (msg.text) {
+          session.sendRealtimeInput({ text: String(msg.text) });
+        }
+      } catch {
+        // Ignore malformed websocket payload
+      }
+    });
+
+    clientWs.on('close', () => {
+      try {
+        session?.close();
+      } catch {
+        // Ignore
+      }
+    });
+  });
+
+  // --- Vite Dev Middleware / Production Static ---
+  if (process.env.NODE_ENV !== 'production') {
+    const vite = await createViteServer({
+      server: {
+        middlewareMode: true,
+        hmr: process.env.DISABLE_HMR !== 'true' ? { server } : false,
+      },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distDir = path.join(__dirname, 'dist');
+    app.use(express.static(distDir));
+    app.get('*', (_req, res) => {
+      res.sendFile(path.join(distDir, 'index.html'));
+    });
+  }
+
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`NEXUS AI server running at http://0.0.0.0:${PORT}`);
+  });
+}
+
+startServer().catch((err) => {
+  console.error('Failed to start NEXUS AI server:', err);
+  process.exit(1);
+});

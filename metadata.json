@@ -1,0 +1,6 @@
+{
+  "name": "NEXUS AI",
+  "description": "Assistente pessoal inteligente controlado por voz em português, com leitor multimédia, explorador de ficheiros, leitura de PDFs e automação com Gemini.",
+  "requestFramePermissions": ["microphone", "camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
